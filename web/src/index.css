@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@theme {
+  --font-serif: "Noto Serif JP", "Shippori Mincho", "Hiragino Mincho ProN", serif;
+  --color-paper: #f3ead7;
+  --color-ink: #1c1410;
+  --color-rule: #2a2118;
+  --color-muted: #6b5c4c;
+  --color-crimson: #8a1c1c;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-serif);
+}
+
+.paper-grain {
+  background-color: var(--color-paper);
+  background-image:
+    radial-gradient(rgba(28, 20, 16, 0.035) 0.6px, transparent 0.6px),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.25), transparent 40%);
+  background-size: 3px 3px, 100% 280px;
+}
+
+.summary-lines {
+  white-space: pre-line;
+}
