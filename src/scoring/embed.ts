@@ -37,7 +37,7 @@ export async function embedPendingArticles(): Promise<number> {
   const db = getDb();
   const rows = db
     .prepare(
-      `SELECT * FROM articles WHERE embedding IS NULL ORDER BY id DESC LIMIT 80`,
+      `SELECT * FROM articles WHERE embedding IS NULL ORDER BY id DESC LIMIT 200`,
     )
     .all() as ArticleRow[];
   if (rows.length === 0) return 0;

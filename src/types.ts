@@ -21,13 +21,21 @@ export type ArticleRow = {
   fetched_at: string;
 };
 
+export type EditionSource = {
+  name: string;
+  url: string;
+};
+
 export type EditionItem = {
   articleId: number;
+  articleIds: number[];
   title: string;
   url: string;
   sourceName: string;
+  sources: EditionSource[];
   summary: string;
   highlights: string[];
+  angles: string[];
   score: number;
   feedback: FeedbackKind | null;
 };
@@ -63,6 +71,7 @@ export type Status = {
   skipCount: number;
   hasPreference: boolean;
   openaiConfigured: boolean;
+  llmError: string | null;
   todayEdition: boolean;
   today: string;
 };

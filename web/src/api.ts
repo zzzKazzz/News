@@ -1,12 +1,25 @@
 export type FeedbackKind = "like" | "skip" | "deep_dive";
 
+export type ChatTurn = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+export type EditionSource = {
+  name: string;
+  url: string;
+};
+
 export type EditionItem = {
   articleId: number;
+  articleIds?: number[];
   title: string;
   url: string;
   sourceName: string;
+  sources?: EditionSource[];
   summary: string;
   highlights: string[];
+  angles?: string[];
   score: number;
   feedback: FeedbackKind | null;
 };
@@ -27,6 +40,7 @@ export type Status = {
   skipCount: number;
   hasPreference: boolean;
   openaiConfigured: boolean;
+  llmError?: string | null;
   todayEdition: boolean;
   today: string;
 };
@@ -68,9 +82,25 @@ export const api = {
       body: JSON.stringify({ enabled }),
     }),
   deleteSource: (id: number) => request(`/api/sources/${id}`, { method: "DELETE" }),
-  feedback: (articleId: number, kind: FeedbackKind) =>
-    request(`/api/articles/${articleId}/feedback`, {
+  chat: (
+    articleIds: number | number[],
+    messages: ChatTurn[],
+    story: { title: string; summary: string; highlights: string[]; angles?: string[] },
+  ) =>
+    request<{ ok: boolean; reply: string }>("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ kind }),
+      body: JSON.stringify({
+        ids: Array.isArray(articleIds) ? articleIds : [articleIds],
+        messages,
+        story,
+      }),
+    }),
+  feedback: (articleIds: number | number[], kind: FeedbackKind) =>
+    request(`/api/articles/feedback`, {
+      method: "POST",
+      body: JSON.stringify({
+        ids: Array.isArray(articleIds) ? articleIds : [articleIds],
+        kind,
+      }),
     }),
 };

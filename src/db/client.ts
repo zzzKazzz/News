@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import Database from "better-sqlite3";
 import { SCHEMA_SQL } from "./schema";
+import { todayJst } from "../lib/date";
 import { DATA_DIR, DB_PATH, DEFAULT_FEEDS_PATH } from "../paths";
 
 let db: Database.Database | null = null;
@@ -24,17 +25,20 @@ export function initDb(): Database.Database {
 }
 
 function seedSources(database: Database.Database) {
-  const count = database.prepare(`SELECT COUNT(*) AS n FROM sources`).get() as {
-    n: number;
-  };
-  if (count.n > 0) return;
   const raw = fs.readFileSync(DEFAULT_FEEDS_PATH, "utf8");
   const feeds = JSON.parse(raw) as { name: string; url: string }[];
   const insert = database.prepare(
     `INSERT OR IGNORE INTO sources (name, url, enabled) VALUES (?, ?, 1)`,
   );
+  let added = 0;
   const tx = database.transaction(() => {
-    for (const feed of feeds) insert.run(feed.name, feed.url);
+    for (const feed of feeds) {
+      const info = insert.run(feed.name, feed.url);
+      if (info.changes > 0) added += 1;
+    }
   });
   tx();
+  if (added > 0) {
+    database.prepare(`DELETE FROM editions WHERE date = ?`).run(todayJst());
+  }
 }

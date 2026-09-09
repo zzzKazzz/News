@@ -3,9 +3,10 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { getDb } from "../db/client";
 import { runIngest } from "../ingest/rss";
-import { applyFeedback } from "../feedback/learn";
+import { applyFeedback, applyFeedbackMany } from "../feedback/learn";
 import { generateEdition, getEdition } from "../synthesis/edition";
-import { isLlmConfigured } from "../synthesis/summarize";
+import { diveChat, normalizeStory, normalizeTurns } from "../synthesis/chat";
+import { isLlmConfigured, llmFailureReason } from "../synthesis/summarize";
 import { todayJst } from "../lib/date";
 import type { FeedbackKind, Source, Status } from "../types";
 
@@ -35,11 +36,12 @@ export function createApp() {
       .prepare(`SELECT MAX(fetched_at) AS t FROM articles`)
       .get() as { t: string | null };
     const pref = db
-      .prepare(`SELECT like_count, skip_count, like_vector FROM preference WHERE id = 1`)
+      .prepare(`SELECT like_count, skip_count, like_vector, skip_vector FROM preference WHERE id = 1`)
       .get() as {
       like_count: number;
       skip_count: number;
       like_vector: Buffer | null;
+      skip_vector: Buffer | null;
     };
     const today = todayJst();
     const edition = db
@@ -51,8 +53,9 @@ export function createApp() {
       lastFetchedAt: last.t,
       likeCount: pref?.like_count ?? 0,
       skipCount: pref?.skip_count ?? 0,
-      hasPreference: Boolean(pref?.like_vector),
+      hasPreference: Boolean(pref?.like_vector || pref?.skip_vector),
       openaiConfigured: isLlmConfigured(),
+      llmError: llmFailureReason(),
       todayEdition: Boolean(edition),
       today,
     };
@@ -60,8 +63,8 @@ export function createApp() {
   });
 
   app.get("/api/edition", (c) => {
-    const date = c.req.query("date");
-    const edition = getEdition(date || undefined);
+    const date = c.req.query("date") || todayJst();
+    const edition = getEdition(date);
     if (!edition) return c.json({ edition: null });
     return c.json({ edition });
   });
@@ -130,6 +133,39 @@ export function createApp() {
     const id = Number(c.req.param("id"));
     getDb().prepare(`DELETE FROM sources WHERE id = ?`).run(id);
     return c.json({ ok: true });
+  });
+
+  app.post("/api/articles/feedback", async (c) => {
+    const body = await c.req.json<{ ids?: number[]; kind?: FeedbackKind }>();
+    if (!body.kind) return c.json({ error: "kind が必要です" }, 400);
+    try {
+      applyFeedbackMany(body.ids ?? [], body.kind);
+      return c.json({ ok: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "評価に失敗しました";
+      return c.json({ error: message }, 400);
+    }
+  });
+
+  app.post("/api/chat", async (c) => {
+    const body = await c.req.json<{
+      ids?: number[];
+      messages?: unknown;
+      story?: unknown;
+    }>();
+    const ids = Array.isArray(body.ids) ? body.ids : [];
+    try {
+      const reply = await diveChat(
+        ids,
+        normalizeTurns(body.messages),
+        normalizeStory(body.story),
+      );
+      return c.json({ ok: true, reply });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "深掘りに失敗しました";
+      const status = message.includes("見つかりません") ? 400 : 502;
+      return c.json({ error: message }, status);
+    }
   });
 
   app.post("/api/articles/:id/feedback", async (c) => {

@@ -3,21 +3,40 @@ import { getDb } from "../db/client";
 import { excerptFrom, extractArticle } from "./extract";
 import { embedPendingArticles } from "../scoring/embed";
 import { rescoreArticles } from "../scoring/score";
+import { isPdfContent, isPdfUrl, isReadableText, sanitizeText } from "../lib/text";
 import type { IngestResult, Source } from "../types";
 
 const UA = "PersonalNewspaper/0.1 (+local; private reader)";
 const parser = new Parser({
   timeout: 20_000,
   headers: { "User-Agent": UA },
+  customFields: {
+    item: [["content:encoded", "contentEncoded"]],
+  },
 });
 
-const MAX_ITEMS_PER_FEED = 8;
-const FETCH_GAP_MS = 350;
+const MAX_ITEMS_PER_FEED = 4;
+const EXTRACT_CONCURRENCY = 4;
 
 let running = false;
 
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+async function mapPool<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = [];
+  let i = 0;
+  const worker = async () => {
+    while (i < items.length) {
+      const idx = i;
+      i += 1;
+      out[idx] = await fn(items[idx]);
+    }
+  };
+  const n = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: n }, worker));
+  return out;
 }
 
 export async function runIngest(): Promise<IngestResult> {
@@ -54,48 +73,58 @@ export async function runIngest(): Promise<IngestResult> {
       }
 
       const items = (feed.items ?? []).slice(0, MAX_ITEMS_PER_FEED);
-      for (const item of items) {
-        const url = item.link?.trim();
-        if (!url) {
-          result.failed += 1;
-          continue;
-        }
-        if (exists.get(url)) {
-          result.skipped += 1;
-          continue;
-        }
+      const prepared = await mapPool(items, EXTRACT_CONCURRENCY, async (item) => {
+        const url = canonicalItemUrl(item);
+        if (!url) return { kind: "failed" as const };
+        if (exists.get(url)) return { kind: "skipped" as const };
 
-        const rssText = stripHtml(
-          item.contentSnippet || item.content || item.summary || "",
+        const rssText = sanitizeText(
+          stripHtml(
+            item.contentEncoded || item.content || item.contentSnippet || item.summary || "",
+          ),
         );
-        let title = (item.title ?? "").trim() || "無題";
+        let title = sanitizeText((item.title ?? "").trim() || "無題");
         let content = rssText;
 
-        try {
-          const extracted = await extractArticle(url);
-          if (extracted) {
-            if (extracted.title) title = extracted.title;
-            content = extracted.content;
+        if (isPdfUrl(url) || isPdfContent(rssText)) {
+          content = isReadableText(rssText) ? rssText : "";
+        } else if (rssText.length < 400) {
+          try {
+            const extracted = await extractArticle(url);
+            if (extracted) {
+              if (extracted.title) title = extracted.title;
+              content = extracted.content;
+            }
+          } catch (err) {
+            console.warn(`[ingest] extract failed: ${url}`, err);
           }
-        } catch (err) {
-          console.warn(`[ingest] extract failed: ${url}`, err);
         }
 
-        if (!content) {
-          result.failed += 1;
-          continue;
-        }
+        if (!isReadableText(content)) return { kind: "failed" as const };
+        return {
+          kind: "ok" as const,
+          row: {
+            source_id: source.id,
+            title,
+            url,
+            content,
+            excerpt: excerptFrom(content),
+            published_at: toIso(item.isoDate || item.pubDate),
+          },
+        };
+      });
 
-        insert.run({
-          source_id: source.id,
-          title,
-          url,
-          content,
-          excerpt: excerptFrom(content),
-          published_at: toIso(item.isoDate || item.pubDate),
-        });
-        result.inserted += 1;
-        await sleep(FETCH_GAP_MS);
+      for (const item of prepared) {
+        if (item.kind === "skipped") result.skipped += 1;
+        else if (item.kind === "failed") result.failed += 1;
+        else {
+          try {
+            insert.run(item.row);
+            result.inserted += 1;
+          } catch {
+            result.skipped += 1;
+          }
+        }
       }
     }
 
@@ -105,6 +134,29 @@ export async function runIngest(): Promise<IngestResult> {
   } finally {
     running = false;
   }
+}
+
+function canonicalItemUrl(item: {
+  link?: string;
+  content?: string;
+  contentEncoded?: string;
+  summary?: string;
+}): string | null {
+  const html = item.contentEncoded || item.content || item.summary || "";
+  const fromHtml = html.match(
+    /href="(https?:\/\/(?!news\.google\.com)[^"]+)"/i,
+  );
+  if (fromHtml?.[1]) return fromHtml[1];
+  const raw = item.link?.trim();
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    const nested = u.searchParams.get("url");
+    if (nested) return nested;
+  } catch {
+    return raw;
+  }
+  return raw;
 }
 
 function stripHtml(s: string): string {

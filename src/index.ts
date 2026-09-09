@@ -6,9 +6,11 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { createApp } from "./api/routes";
 import { initDb } from "./db/client";
 import { startScheduler } from "./jobs/scheduler";
+import { rescoreArticles } from "./scoring/score";
 import { WEB_DIST_DIR } from "./paths";
 
 initDb();
+rescoreArticles();
 startScheduler();
 
 const app = createApp();

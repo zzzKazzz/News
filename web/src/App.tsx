@@ -7,6 +7,15 @@ import {
   type Source,
   type Status,
 } from "./api";
+import { DeepDiveChat } from "./DeepDive";
+
+type Busy = "ingest" | "edition" | "bootstrap" | null;
+
+function todayJst(): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tokyo" }).format(
+    new Date(),
+  );
+}
 
 function formatDate(iso: string) {
   const d = new Date(`${iso}T00:00:00+09:00`);
@@ -19,20 +28,85 @@ function formatDate(iso: string) {
   }).format(d);
 }
 
+type BootResult = {
+  status: Status;
+  edition: Edition | null;
+  sources: Source[];
+};
+
+let bootInFlight: Promise<BootResult> | null = null;
+const bootPhaseListeners = new Set<(phase: Exclude<Busy, null>) => void>();
+
+function isBusyError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes("実行中");
+}
+
+async function loadToday(sources: Source[]): Promise<BootResult> {
+  const status = await api.status();
+  const e = await api.edition(status.today);
+  return { status, edition: e.edition, sources };
+}
+
+async function waitForTodayEdition(sources: Source[]): Promise<BootResult> {
+  for (let i = 0; i < 90; i++) {
+    const result = await loadToday(sources);
+    if (result.status.todayEdition && result.edition) return result;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error("朝刊の準備がタイムアウトしました");
+}
+
+function ensureTodayEdition(
+  onPhase: (phase: Exclude<Busy, null>) => void,
+): Promise<BootResult> {
+  bootPhaseListeners.add(onPhase);
+  if (!bootInFlight) {
+    const emit = (phase: Exclude<Busy, null>) => {
+      for (const listener of bootPhaseListeners) listener(phase);
+    };
+    bootInFlight = (async () => {
+      const [status, src] = await Promise.all([api.status(), api.sources()]);
+      if (status.todayEdition) return loadToday(src.sources);
+      emit("ingest");
+      try {
+        await api.ingest();
+      } catch (err) {
+        if (!isBusyError(err)) throw err;
+        emit("edition");
+        return waitForTodayEdition(src.sources);
+      }
+      emit("edition");
+      try {
+        const res = await api.generate();
+        const next = await api.status();
+        return { status: next, edition: res.edition, sources: src.sources };
+      } catch (err) {
+        if (!isBusyError(err)) throw err;
+        return waitForTodayEdition(src.sources);
+      }
+    })().finally(() => {
+      bootInFlight = null;
+      bootPhaseListeners.clear();
+    });
+  }
+  return bootInFlight;
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [edition, setEdition] = useState<Edition | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [busy, setBusy] = useState<"ingest" | "edition" | null>(null);
+  const [busy, setBusy] = useState<Busy>("bootstrap");
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
+  const [diveItem, setDiveItem] = useState<EditionItem | null>(null);
 
   const refresh = useCallback(async () => {
-    const [s, e, src] = await Promise.all([
-      api.status(),
-      api.edition(),
+    const s = await api.status();
+    const [e, src] = await Promise.all([
+      api.edition(s.today),
       api.sources(),
     ]);
     setStatus(s);
@@ -41,10 +115,28 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    refresh().catch((err: unknown) => {
-      setError(err instanceof Error ? err.message : "読み込みに失敗しました");
-    });
-  }, [refresh]);
+    let cancelled = false;
+    setBusy("bootstrap");
+    ensureTodayEdition((phase) => {
+      if (!cancelled) setBusy(phase);
+    })
+      .then((result) => {
+        if (cancelled) return;
+        setStatus(result.status);
+        setEdition(result.edition);
+        setSources(result.sources);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : "読み込みに失敗しました");
+      })
+      .finally(() => {
+        if (!cancelled) setBusy(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const run = async (kind: "ingest" | "edition") => {
     setError(null);
@@ -63,16 +155,16 @@ export default function App() {
     }
   };
 
-  const onFeedback = async (articleId: number, kind: FeedbackKind) => {
-    await api.feedback(articleId, kind);
+  const onFeedback = async (item: EditionItem, kind: FeedbackKind) => {
+    await api.feedback(item.articleIds?.length ? item.articleIds : item.articleId, kind);
     setEdition((cur) => {
       if (!cur) return cur;
-      const patch = (item: EditionItem | null) =>
-        item && item.articleId === articleId ? { ...item, feedback: kind } : item;
+      const patch = (row: EditionItem) =>
+        row.articleId === item.articleId ? { ...row, feedback: kind } : row;
       return {
         ...cur,
-        lead: patch(cur.lead),
-        articles: cur.articles.map((a) => patch(a) ?? a),
+        lead: cur.lead ? patch(cur.lead) : null,
+        articles: cur.articles.map(patch),
       };
     });
   };
@@ -91,8 +183,8 @@ export default function App() {
   };
 
   const dateLabel = useMemo(
-    () => formatDate(edition?.date || status?.today || new Date().toISOString().slice(0, 10)),
-    [edition?.date, status?.today],
+    () => formatDate(status?.today || todayJst()),
+    [status?.today],
   );
 
   return (
@@ -120,7 +212,7 @@ export default function App() {
               disabled={busy !== null}
               onClick={() => run("ingest")}
             >
-              {busy === "ingest" ? "巡回中…" : "今すぐ収集"}
+              {busy === "ingest" || busy === "bootstrap" ? "巡回中…" : "今すぐ収集"}
             </ActionButton>
             <ActionButton
               disabled={busy !== null}
@@ -141,9 +233,9 @@ export default function App() {
           )}
         </nav>
 
-        {error && (
+        {(error || status?.llmError) && (
           <p className="mt-4 border border-crimson/40 bg-crimson/5 px-3 py-2 text-sm text-crimson">
-            {error}
+            {error || status?.llmError}
           </p>
         )}
 
@@ -164,8 +256,16 @@ export default function App() {
               setSources((await api.sources()).sources);
             }}
           />
+        ) : busy !== null && !edition?.lead ? (
+          <PreparingState phase={busy} />
         ) : edition?.lead ? (
-          <Paper edition={edition} onFeedback={onFeedback} />
+          <Paper
+            edition={edition}
+            onFeedback={onFeedback}
+            onDeepDive={setDiveItem}
+          />
+        ) : edition ? (
+          <FinishedState />
         ) : (
           <EmptyState
             hasArticles={(status?.articleCount ?? 0) > 0}
@@ -176,9 +276,12 @@ export default function App() {
         )}
 
         <footer className="mt-12 border-t border-ink/30 pt-4 text-center text-xs tracking-widest text-muted">
-          嗜好エンジンはローカル · クラウドへ送るのは記事本文の要約のみ
+          嗜好エンジンはローカル · クラウドへ送るのは記事本文と深掘り会話のみ
         </footer>
       </div>
+      {diveItem && (
+        <DeepDiveChat item={diveItem} onClose={() => setDiveItem(null)} />
+      )}
     </div>
   );
 }
@@ -204,6 +307,32 @@ function ActionButton({
   );
 }
 
+function PreparingState({ phase }: { phase: Exclude<Busy, null> }) {
+  const label =
+    phase === "ingest"
+      ? "フィードを巡回しています…"
+      : phase === "edition"
+        ? "今日の朝刊を組んでいます…"
+        : "今日の朝刊を準備しています…";
+  return (
+    <section className="mt-16 text-center">
+      <h2 className="text-2xl font-bold tracking-widest">{label}</h2>
+      <p className="mt-3 text-muted">
+        最新の記事を集めて、本日の紙面を編集します。
+      </p>
+    </section>
+  );
+}
+
+function FinishedState() {
+  return (
+    <section className="mt-16 text-center">
+      <h2 className="text-2xl font-bold tracking-widest">今日の紙面は読み終わりました</h2>
+      <p className="mt-3 text-muted">評価は手元の好み学習に使いました。</p>
+    </section>
+  );
+}
+
 function EmptyState({
   hasArticles,
   busy,
@@ -211,7 +340,7 @@ function EmptyState({
   onGenerate,
 }: {
   hasArticles: boolean;
-  busy: "ingest" | "edition" | null;
+  busy: Busy;
   onIngest: () => void;
   onGenerate: () => void;
 }) {
@@ -240,14 +369,20 @@ function EmptyState({
 function Paper({
   edition,
   onFeedback,
+  onDeepDive,
 }: {
   edition: Edition;
-  onFeedback: (id: number, kind: FeedbackKind) => void;
+  onFeedback: (item: EditionItem, kind: FeedbackKind) => void;
+  onDeepDive: (item: EditionItem) => void;
 }) {
   return (
     <article className="mt-8">
       {edition.lead && (
-        <LeadStory item={edition.lead} onFeedback={onFeedback} />
+        <LeadStory
+          item={edition.lead}
+          onFeedback={onFeedback}
+          onDeepDive={onDeepDive}
+        />
       )}
       {edition.articles.length > 0 && (
         <>
@@ -256,7 +391,13 @@ function Paper({
           </h2>
           <div className="grid gap-8 md:grid-cols-2 lg:grid-cols-3">
             {edition.articles.map((item) => (
-              <Story key={item.articleId} item={item} onFeedback={onFeedback} compact />
+              <Story
+                key={item.articleId}
+                item={item}
+                onFeedback={onFeedback}
+                onDeepDive={onDeepDive}
+                compact
+              />
             ))}
           </div>
         </>
@@ -268,9 +409,11 @@ function Paper({
 function LeadStory({
   item,
   onFeedback,
+  onDeepDive,
 }: {
   item: EditionItem;
-  onFeedback: (id: number, kind: FeedbackKind) => void;
+  onFeedback: (item: EditionItem, kind: FeedbackKind) => void;
+  onDeepDive: (item: EditionItem) => void;
 }) {
   return (
     <section>
@@ -278,7 +421,8 @@ function LeadStory({
       <h2 className="mt-2 text-3xl font-black leading-snug sm:text-5xl">{item.title}</h2>
       <p className="summary-lines mt-5 text-lg leading-8">{item.summary}</p>
       <Highlights items={item.highlights} />
-      <StoryMeta item={item} onFeedback={onFeedback} />
+      <Angles items={item.angles ?? []} />
+      <StoryMeta item={item} onFeedback={onFeedback} onDeepDive={onDeepDive} />
     </section>
   );
 }
@@ -286,10 +430,12 @@ function LeadStory({
 function Story({
   item,
   onFeedback,
+  onDeepDive,
   compact,
 }: {
   item: EditionItem;
-  onFeedback: (id: number, kind: FeedbackKind) => void;
+  onFeedback: (item: EditionItem, kind: FeedbackKind) => void;
+  onDeepDive: (item: EditionItem) => void;
   compact?: boolean;
 }) {
   return (
@@ -298,7 +444,8 @@ function Story({
       <h3 className="mt-1 text-xl font-bold leading-snug">{item.title}</h3>
       <p className="summary-lines mt-3 leading-7">{item.summary}</p>
       <Highlights items={item.highlights} />
-      <StoryMeta item={item} onFeedback={onFeedback} />
+      <Angles items={item.angles ?? []} />
+      <StoryMeta item={item} onFeedback={onFeedback} onDeepDive={onDeepDive} />
     </section>
   );
 }
@@ -314,39 +461,77 @@ function Highlights({ items }: { items: string[] }) {
   );
 }
 
+function Angles({ items }: { items: string[] }) {
+  if (items.length === 0) return null;
+  return (
+    <ul className="mt-3 space-y-1 text-sm text-muted">
+      {items.map((h) => (
+        <li key={h}>{h}</li>
+      ))}
+    </ul>
+  );
+}
+
+const FEEDBACK_MESSAGE = {
+  like: "似た記事の表示頻度を増やします",
+  skip: "似た記事の表示頻度を減らします",
+} as const;
+
 function StoryMeta({
   item,
   onFeedback,
+  onDeepDive,
 }: {
   item: EditionItem;
-  onFeedback: (id: number, kind: FeedbackKind) => void;
+  onFeedback: (item: EditionItem, kind: FeedbackKind) => void;
+  onDeepDive: (item: EditionItem) => void;
 }) {
-  const btn = (kind: FeedbackKind, label: string) => (
+  const interest =
+    item.feedback === "like" || item.feedback === "skip" ? item.feedback : null;
+  const btn = (kind: "like" | "skip", label: string) => (
     <button
       type="button"
-      onClick={() => onFeedback(item.articleId, kind)}
-      className={`border px-2 py-0.5 text-xs tracking-wider ${
-        item.feedback === kind
-          ? "border-crimson bg-crimson text-paper"
-          : "border-ink/40 hover:border-ink"
-      }`}
+      onClick={() => onFeedback(item, kind)}
+      className="border border-ink/40 px-2 py-0.5 text-xs tracking-wider hover:border-ink"
     >
       {label}
     </button>
   );
+  const sources = item.sources?.length
+    ? item.sources
+    : [{ name: "原文", url: item.url }];
   return (
     <div className="mt-4 flex flex-wrap items-center gap-2">
-      {btn("like", "刺さった")}
-      {btn("skip", "興味なし")}
-      {btn("deep_dive", "深掘り希望")}
-      <a
-        href={item.url}
-        target="_blank"
-        rel="noreferrer"
-        className="ml-auto text-xs tracking-wider underline"
+      {interest ? (
+        <p className="text-xs tracking-wider text-muted">
+          {FEEDBACK_MESSAGE[interest]}
+        </p>
+      ) : (
+        <>
+          {btn("like", "興味あり")}
+          {btn("skip", "興味なし")}
+        </>
+      )}
+      <button
+        type="button"
+        onClick={() => onDeepDive(item)}
+        className="border border-ink/40 px-2 py-0.5 text-xs tracking-wider hover:border-ink"
       >
-        原文
-      </a>
+        深掘り
+      </button>
+      <span className="ml-auto flex flex-wrap justify-end gap-2 text-xs tracking-wider">
+        {sources.map((source) => (
+          <a
+            key={`${source.name}-${source.url}`}
+            href={source.url}
+            target="_blank"
+            rel="noreferrer"
+            className="underline"
+          >
+            {source.name}
+          </a>
+        ))}
+      </span>
     </div>
   );
 }

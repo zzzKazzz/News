@@ -6,17 +6,31 @@ import type { FeedbackKind } from "../types";
 const KINDS: FeedbackKind[] = ["like", "skip", "deep_dive"];
 
 export function applyFeedback(articleId: number, kind: FeedbackKind): void {
-  if (!KINDS.includes(kind)) throw new Error("不正な評価です");
-  const db = getDb();
-  const article = db
-    .prepare(`SELECT id FROM articles WHERE id = ?`)
-    .get(articleId) as { id: number } | undefined;
-  if (!article) throw new Error("記事が見つかりません");
+  applyFeedbackMany([articleId], kind);
+}
 
-  db.prepare(
+export function applyFeedbackMany(articleIds: number[], kind: FeedbackKind): void {
+  if (!KINDS.includes(kind)) throw new Error("不正な評価です");
+  const ids = [...new Set(articleIds.filter((id) => Number.isInteger(id) && id > 0))];
+  if (ids.length === 0) throw new Error("記事が見つかりません");
+
+  const db = getDb();
+  const exists = db.prepare(`SELECT id FROM articles WHERE id = ?`);
+  const upsert = db.prepare(
     `INSERT INTO feedback (article_id, kind) VALUES (?, ?)
      ON CONFLICT(article_id) DO UPDATE SET kind = excluded.kind, created_at = datetime('now')`,
-  ).run(articleId, kind);
+  );
+
+  let wrote = 0;
+  const tx = db.transaction(() => {
+    for (const id of ids) {
+      if (!exists.get(id)) continue;
+      upsert.run(id, kind);
+      wrote += 1;
+    }
+  });
+  tx();
+  if (wrote === 0) throw new Error("記事が見つかりません");
 
   recomputePreference();
   rescoreArticles();
